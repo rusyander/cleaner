@@ -1624,6 +1624,69 @@ namespace WindowsProcessCleaner
             return "> docker " + args + "\r\n" + outp + "\r\n";
         }
 
+        // Находит самый большой виртуальный диск Docker (WSL2).
+        public string FindDockerVhdx()
+        {
+            string lad = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            string[] cands = {
+                Path.Combine(lad, "Docker\\wsl\\disk\\docker_data.vhdx"),
+                Path.Combine(lad, "Docker\\wsl\\data\\ext4.vhdx"),
+                Path.Combine(lad, "Docker\\wsl\\main\\ext4.vhdx")
+            };
+            string best = null; long bestSize = -1;
+            foreach (string c in cands)
+            {
+                try { if (File.Exists(c)) { long s = new FileInfo(c).Length; if (s > bestSize) { bestSize = s; best = c; } } }
+                catch { }
+            }
+            return best;
+        }
+
+        // Останавливает Docker (WSL) и сжимает vhdx через diskpart — реально
+        // возвращает место на диске Windows (prune освобождает только ВНУТРИ vhdx).
+        public string CompactDockerDisk()
+        {
+            string vhdx = FindDockerVhdx();
+            if (vhdx == null)
+                return Tr.S("Не найден виртуальный диск Docker (docker_data.vhdx / ext4.vhdx).\r\n" +
+                            "Возможно, Docker Desktop не установлен или использует другой backend.",
+                            "Docker virtual disk not found (docker_data.vhdx / ext4.vhdx).\r\n" +
+                            "Docker Desktop may not be installed or uses a different backend.");
+            long before = 0;
+            try { before = new FileInfo(vhdx).Length; } catch { }
+            StringBuilder sb = new StringBuilder();
+            sb.AppendLine(Tr.S("Диск: ", "Disk: ") + vhdx);
+            sb.AppendLine(Tr.S("Размер до: ", "Size before: ") + FormatBytes(before));
+            sb.AppendLine();
+
+            int ec;
+            sb.AppendLine("> wsl --shutdown");
+            sb.AppendLine(RunCapture("wsl", "--shutdown", out ec));
+            System.Threading.Thread.Sleep(4000);
+
+            string script = "select vdisk file=\"" + vhdx + "\"\r\n" +
+                            "attach vdisk readonly\r\ncompact vdisk\r\ndetach vdisk\r\nexit\r\n";
+            string scriptPath = Path.Combine(Path.GetTempPath(), "wpc_compact.txt");
+            try { File.WriteAllText(scriptPath, script); } catch { }
+            sb.AppendLine("> diskpart compact vdisk …");
+            string dp = RunCapture("diskpart", "/s \"" + scriptPath + "\"", out ec);
+            dp = dp.Replace("\r\n", "\n").Replace("\n", "\r\n");
+            sb.AppendLine(dp);
+            try { File.Delete(scriptPath); } catch { }
+
+            long after = before;
+            try { after = new FileInfo(vhdx).Length; } catch { }
+            sb.AppendLine();
+            sb.AppendLine(Tr.S("Размер после: ", "Size after: ") + FormatBytes(after));
+            long freed = before - after;
+            sb.AppendLine(Tr.S("Освобождено на диске Windows: ", "Reclaimed on Windows disk: ") +
+                          FormatBytes(freed > 0 ? freed : 0));
+            if (freed <= 0)
+                sb.AppendLine(Tr.S("(если 0 — закройте Docker Desktop полностью и повторите: файл был занят)",
+                                   "(if 0 — fully quit Docker Desktop and retry: the file was locked)"));
+            return sb.ToString();
+        }
+
         // ---------- Автозапуск с Windows ----------
         // Приложение запускается от администратора (requireAdministrator), поэтому
         // ключ реестра Run для автозапуска не годится (Windows не запускает из него
@@ -2768,17 +2831,28 @@ namespace WindowsProcessCleaner
             AddDockerButton(flow, Tr.S("Очистить кэш сборки", "Clear build cache"), "builder prune -a -f", true);
             AddDockerButton(flow, Tr.S("Полная очистка", "Full cleanup"), "system prune -a -f --volumes", true);
 
+            Button bCompact = new Button();
+            bCompact.Text = Tr.S("Сжать диск Docker (вернуть место Windows)", "Compact Docker disk (reclaim Windows space)");
+            bCompact.Width = 340; bCompact.Height = 34; bCompact.Margin = new Padding(4);
+            bCompact.Tag = "primary";
+            bCompact.Click += delegate { DoCompactDocker(); };
+            flow.Controls.Add(bCompact);
+
             Label note = new Label();
             note.Name = "muted";
             note.Dock = DockStyle.Top;
-            note.Height = 40;
+            note.Height = 58;
             note.Text = Tr.S(
                 "Удаляется только НЕиспользуемое (prune): остановленные контейнеры, образы без тегов/ссылок, " +
                 "тома без владельцев, кэш сборки. Запущенные контейнеры и используемые образы не трогаются.\r\n" +
-                "Kubernetes не включён: его очистка бьёт по живому кластеру и зависит от контекста — добавлю по запросу.",
+                "⚠ prune освобождает место ВНУТРИ виртуального диска Docker, но сам файл на Windows не уменьшается. " +
+                "Чтобы реально вернуть место на диске Windows — «Сжать диск Docker» (остановит Docker и сожмёт vhdx).\r\n" +
+                "Kubernetes не включён: его очистка бьёт по живому кластеру.",
                 "Only UNUSED data is removed (prune): stopped containers, dangling/unreferenced images, " +
                 "unused volumes, build cache. Running containers and used images are never touched.\r\n" +
-                "Kubernetes is not included: its cleanup affects a live cluster and depends on context — available on request.");
+                "⚠ prune frees space INSIDE Docker's virtual disk, but the file on Windows doesn't shrink. " +
+                "To actually reclaim Windows disk space use “Compact Docker disk” (stops Docker and compacts the vhdx).\r\n" +
+                "Kubernetes is not included: its cleanup affects a live cluster.");
             note.Font = new Font(Font.FontFamily, 9.5F);
 
             _txtDocker = new RichTextBox();
@@ -2824,6 +2898,36 @@ namespace WindowsProcessCleaner
             Thread t = new Thread(delegate()
             {
                 string res = _engine.Docker(args);
+                try
+                {
+                    BeginInvoke((MethodInvoker)delegate
+                    {
+                        Cursor = Cursors.Default;
+                        _txtDocker.Text = res;
+                    });
+                }
+                catch { }
+            });
+            t.IsBackground = true;
+            t.Start();
+        }
+
+        private void DoCompactDocker()
+        {
+            DialogResult dr = MessageBox.Show(
+                Tr.S("Будет остановлен Docker (все запущенные контейнеры завершатся!) и сжат его виртуальный диск, " +
+                     "чтобы вернуть свободное место на диске Windows.\r\n\r\nПродолжить?",
+                     "Docker will be stopped (all running containers will exit!) and its virtual disk compacted " +
+                     "to reclaim free space on the Windows disk.\r\n\r\nContinue?"),
+                "Docker", MessageBoxButtons.YesNo, MessageBoxIcon.Warning);
+            if (dr != DialogResult.Yes) return;
+
+            _txtDocker.Text = Tr.S("Сжатие диска Docker… это может занять минуту, не закрывайте окно.",
+                                   "Compacting Docker disk… this may take a minute, don't close the window.");
+            Cursor = Cursors.WaitCursor;
+            Thread t = new Thread(delegate()
+            {
+                string res = _engine.CompactDockerDisk();
                 try
                 {
                     BeginInvoke((MethodInvoker)delegate

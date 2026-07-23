@@ -151,8 +151,16 @@ a program isn't in startup, the toggle is off.
 A tab for Docker cleanup (requires the Docker CLI + a running daemon). Buttons: disk
 usage overview (`docker system df`), remove stopped containers, unused images, unused
 volumes, clear build cache, full cleanup of everything unused. Only **unused** data is
-removed (`prune`) — running containers and used images are never touched. Kubernetes is
-not included (its cleanup affects a live cluster).
+removed (`prune`) — running containers and used images are never touched.
+
+> ⚠️ **Important about disk space.** Docker Desktop stores everything in one growing
+> WSL2 virtual disk (`docker_data.vhdx`). `prune` frees space **inside** that disk, but
+> the file on Windows **doesn't shrink**. To actually reclaim Windows disk space, use
+> the **"Compact Docker disk"** button: it stops Docker (`wsl --shutdown`) and compacts
+> the vhdx via `diskpart compact vdisk`, showing size before/after. All running
+> containers are stopped in the process.
+
+Kubernetes is not included (its cleanup affects a live cluster).
 
 ### Interface language
 Russian / English — switchable in settings (applied after restart). The documentation
