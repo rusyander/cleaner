@@ -20,11 +20,13 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Drawing.Imaging;
 using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
@@ -382,7 +384,7 @@ namespace WindowsProcessCleaner
     }
     public class CleanResult { public long Freed; public int Errors; }
 
-    // Установленная программа (для деинсталляции).
+    // Установленная программа (для деинсталляции / автозапуска).
     public class InstalledApp
     {
         public string Name;
@@ -390,7 +392,21 @@ namespace WindowsProcessCleaner
         public string Publisher;
         public string UninstallCmd;
         public string QuietCmd;
+        public string ExePath;   // главный exe (из DisplayIcon), если удалось определить
         public long EstimatedSizeBytes;
+        public bool InAutostart; // вычисляется во вкладке автозапуска
+    }
+
+    // Запись автозапуска (реестр Run или папка «Автозагрузка»).
+    public class AutostartEntry
+    {
+        public string Name;
+        public string Command;
+        public string ExePath;
+        public string SourceLabel;
+        public int Kind;        // 0 HKCU Run, 1 HKLM Run, 2 HKLM WOW Run, 3 Startup(user), 4 Startup(common)
+        public string RegName;  // имя значения в реестре
+        public string LnkPath;  // путь к ярлыку в папке автозагрузки
     }
 
     // ------------------------------------------------------------------ //
@@ -1334,6 +1350,8 @@ namespace WindowsProcessCleaner
                                 app.Publisher = s.GetValue("Publisher") as string;
                                 app.UninstallCmd = unins;
                                 app.QuietCmd = s.GetValue("QuietUninstallString") as string;
+                                app.ExePath = ResolveAppExe(s.GetValue("DisplayIcon") as string,
+                                                            s.GetValue("InstallLocation") as string, disp);
                                 object es = s.GetValue("EstimatedSize");
                                 if (es is int) app.EstimatedSizeBytes = ((long)(int)es) * 1024L;
                                 map[disp] = app;
@@ -1354,6 +1372,218 @@ namespace WindowsProcessCleaner
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
             Process.Start(psi);
+        }
+
+        // ================= АВТОЗАПУСК =================
+        private string ResolveAppExe(string displayIcon, string installLoc, string name)
+        {
+            // 1) из DisplayIcon ("C:\...\app.exe,0")
+            if (!string.IsNullOrEmpty(displayIcon))
+            {
+                string ip = displayIcon.Trim().Trim('"');
+                int comma = ip.LastIndexOf(',');
+                if (comma > 0)
+                {
+                    int idx;
+                    if (int.TryParse(ip.Substring(comma + 1).Trim(), out idx)) ip = ip.Substring(0, comma);
+                }
+                ip = ip.Trim().Trim('"');
+                try { if (ip.ToLowerInvariant().EndsWith(".exe") && File.Exists(ip)) return ip; }
+                catch { }
+            }
+            // 2) поиск exe в InstallLocation по имени программы
+            try
+            {
+                if (!string.IsNullOrEmpty(installLoc) && Directory.Exists(installLoc))
+                {
+                    string[] exes = Directory.GetFiles(installLoc, "*.exe", SearchOption.TopDirectoryOnly);
+                    if (exes.Length == 1) return exes[0];
+                    if (exes.Length > 1 && !string.IsNullOrEmpty(name))
+                    {
+                        string key = new string(name.ToLowerInvariant().Where(char.IsLetterOrDigit).ToArray());
+                        foreach (string e in exes)
+                        {
+                            string fn = new string(Path.GetFileNameWithoutExtension(e).ToLowerInvariant().Where(char.IsLetterOrDigit).ToArray());
+                            if (key.Length > 2 && (key.Contains(fn) || fn.Contains(key))) return e;
+                        }
+                    }
+                }
+            }
+            catch { }
+            return null;
+        }
+
+        private string ParseExeFromCommand(string cmd)
+        {
+            if (string.IsNullOrEmpty(cmd)) return null;
+            cmd = cmd.Trim();
+            if (cmd.StartsWith("\""))
+            {
+                int end = cmd.IndexOf('"', 1);
+                if (end > 0) return cmd.Substring(1, end - 1);
+            }
+            int sp = cmd.IndexOf(' ');
+            string p = sp > 0 ? cmd.Substring(0, sp) : cmd;
+            return p.Trim();
+        }
+
+        private string ResolveLnk(string lnkPath)
+        {
+            try
+            {
+                Type t = Type.GetTypeFromProgID("WScript.Shell");
+                if (t == null) return null;
+                object shell = Activator.CreateInstance(t);
+                object sc = t.InvokeMember("CreateShortcut", BindingFlags.InvokeMethod, null, shell,
+                    new object[] { lnkPath });
+                string target = (string)sc.GetType().InvokeMember("TargetPath", BindingFlags.GetProperty,
+                    null, sc, null);
+                return target;
+            }
+            catch { return null; }
+        }
+
+        private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string RunKeyPathWow = @"Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Run";
+
+        public List<AutostartEntry> GetAutostartEntries()
+        {
+            List<AutostartEntry> list = new List<AutostartEntry>();
+            ReadRun(Registry.CurrentUser, RunKeyPath, 0, "HKCU\\Run", list);
+            ReadRun(Registry.LocalMachine, RunKeyPath, 1, "HKLM\\Run", list);
+            ReadRun(Registry.LocalMachine, RunKeyPathWow, 2, "HKLM\\Run (32-bit)", list);
+            ReadStartupFolder(Environment.SpecialFolder.Startup, 3, "Автозагрузка (пользователь)", list);
+            ReadStartupFolder(Environment.SpecialFolder.CommonStartup, 4, "Автозагрузка (общая)", list);
+            return list;
+        }
+
+        private void ReadRun(RegistryKey root, string sub, int kind, string label, List<AutostartEntry> list)
+        {
+            try
+            {
+                using (RegistryKey k = root.OpenSubKey(sub))
+                {
+                    if (k == null) return;
+                    foreach (string name in k.GetValueNames())
+                    {
+                        string cmd = k.GetValue(name) as string;
+                        if (string.IsNullOrEmpty(cmd)) continue;
+                        AutostartEntry e = new AutostartEntry();
+                        e.Name = name; e.Command = cmd; e.ExePath = ParseExeFromCommand(cmd);
+                        e.Kind = kind; e.SourceLabel = label; e.RegName = name;
+                        list.Add(e);
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private void ReadStartupFolder(Environment.SpecialFolder folder, int kind, string label, List<AutostartEntry> list)
+        {
+            try
+            {
+                string dir = Environment.GetFolderPath(folder);
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
+                foreach (string f in Directory.GetFiles(dir))
+                {
+                    string ext = Path.GetExtension(f).ToLowerInvariant();
+                    if (ext == ".ini") continue;
+                    string target = ext == ".lnk" ? ResolveLnk(f) : f;
+                    AutostartEntry e = new AutostartEntry();
+                    e.Name = Path.GetFileNameWithoutExtension(f);
+                    e.Command = target != null ? target : f;
+                    e.ExePath = target; e.Kind = kind; e.SourceLabel = label; e.LnkPath = f;
+                    list.Add(e);
+                }
+            }
+            catch { }
+        }
+
+        private static string NormPath(string p)
+        {
+            if (string.IsNullOrEmpty(p)) return null;
+            try { return Path.GetFullPath(p).TrimEnd('\\').ToLowerInvariant(); }
+            catch { return p.Trim().TrimEnd('\\').ToLowerInvariant(); }
+        }
+
+        public bool IsExeInAutostart(string exe, List<AutostartEntry> entries)
+        {
+            string np = NormPath(exe);
+            if (np == null) return false;
+            foreach (AutostartEntry e in entries)
+            {
+                string ep = NormPath(e.ExePath);
+                if (ep != null && ep == np) return true;
+            }
+            return false;
+        }
+
+        private static string SanitizeName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return "App";
+            string s = name.Replace('\\', ' ').Replace('/', ' ').Trim();
+            if (s.Length > 60) s = s.Substring(0, 60);
+            return s;
+        }
+
+        public void AddAutostart(string name, string exe)
+        {
+            if (string.IsNullOrEmpty(exe)) return;
+            try
+            {
+                using (RegistryKey k = Registry.CurrentUser.OpenSubKey(RunKeyPath, true))
+                {
+                    if (k != null) k.SetValue(SanitizeName(name), "\"" + exe + "\"");
+                }
+            }
+            catch { }
+        }
+
+        public void RemoveAutostart(string exe, string name)
+        {
+            RemoveFromRun(Registry.CurrentUser, RunKeyPath, exe, name);
+            RemoveFromRun(Registry.LocalMachine, RunKeyPath, exe, name);
+            RemoveFromRun(Registry.LocalMachine, RunKeyPathWow, exe, name);
+            RemoveStartupLnk(Environment.SpecialFolder.Startup, exe);
+            RemoveStartupLnk(Environment.SpecialFolder.CommonStartup, exe);
+        }
+
+        private void RemoveFromRun(RegistryKey root, string sub, string exe, string name)
+        {
+            try
+            {
+                using (RegistryKey k = root.OpenSubKey(sub, true))
+                {
+                    if (k == null) return;
+                    string np = NormPath(exe);
+                    string san = SanitizeName(name);
+                    List<string> toDelete = new List<string>();
+                    foreach (string vn in k.GetValueNames())
+                    {
+                        string cmd = k.GetValue(vn) as string;
+                        string ep = NormPath(ParseExeFromCommand(cmd));
+                        if ((np != null && ep == np) || vn == san) toDelete.Add(vn);
+                    }
+                    foreach (string vn in toDelete) k.DeleteValue(vn, false);
+                }
+            }
+            catch { }
+        }
+
+        private void RemoveStartupLnk(Environment.SpecialFolder folder, string exe)
+        {
+            try
+            {
+                string dir = Environment.GetFolderPath(folder);
+                if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir)) return;
+                string np = NormPath(exe);
+                foreach (string f in Directory.GetFiles(dir, "*.lnk"))
+                {
+                    string target = NormPath(ResolveLnk(f));
+                    if (target != null && target == np) { try { File.Delete(f); } catch { } }
+                }
+            }
+            catch { }
         }
 
         // ================= DOCKER =================
@@ -1475,7 +1705,11 @@ namespace WindowsProcessCleaner
         private ListView _lvApps;
         private Label _lblAppsInfo;
         private List<InstalledApp> _apps;
-        private TextBox _txtDocker;
+        private RichTextBox _txtDocker;
+        private ListView _lvStartup;
+        private Label _lblStartupInfo;
+        private bool _suppressStartup;
+        private Panel _navPanel;
 
         // Настройки — контролы
         private NumericUpDown _numCpu, _numIdle, _numMinLife, _numInterval, _numGlobalIdle;
@@ -1514,27 +1748,110 @@ namespace WindowsProcessCleaner
         }
 
         // ---------- Иконки трея ----------
+        private Icon _iconWindow;
+
         private void BuildIcons()
         {
-            _iconIdle = MakeIcon(Color.FromArgb(90, 160, 90));
-            _iconActive = MakeIcon(Color.FromArgb(220, 150, 40));
+            _iconIdle = MakeIcon(Color.FromArgb(58, 166, 85));    // зелёная — чисто
+            _iconActive = MakeIcon(Color.FromArgb(224, 150, 40)); // оранжевая — есть кандидаты
+            _iconWindow = MakeIcon(Color.FromArgb(45, 120, 224));  // синяя — иконка окна/панели задач
         }
 
+        // Многоразмерная иконка из файла (крипче в трее/на панели задач); фолбэк — рисованная.
+        private Icon LoadAppIcon()
+        {
+            try
+            {
+                string path = Path.Combine(Application.StartupPath, "icon.ico");
+                if (File.Exists(path)) return new Icon(path);
+            }
+            catch { }
+            return _iconWindow;
+        }
+
+        private static GraphicsPath RoundedRect(Rectangle r, int radius)
+        {
+            GraphicsPath p = new GraphicsPath();
+            int d = radius * 2;
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        // Чёткая иконка с настоящим альфа-каналом: собираем многоразмерный .ico
+        // из PNG (16..64px). GetHicon НЕ используем — он теряет прозрачность и даёт
+        // чёрный ореол/невидимость в трее.
         private Icon MakeIcon(Color c)
         {
-            using (Bitmap bmp = new Bitmap(32, 32))
+            int[] sizes = { 16, 20, 24, 32, 48, 64 };
+            Bitmap[] bmps = new Bitmap[sizes.Length];
+            for (int i = 0; i < sizes.Length; i++) bmps[i] = DrawIconBitmap(sizes[i], c);
+            Icon ico = IconFromBitmaps(bmps);
+            foreach (Bitmap b in bmps) b.Dispose();
+            return ico;
+        }
+
+        private Bitmap DrawIconBitmap(int S, Color c)
+        {
+            Bitmap bmp = new Bitmap(S, S);
             using (Graphics g = Graphics.FromImage(bmp))
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.Clear(Color.Transparent);
-                using (SolidBrush b = new SolidBrush(c)) g.FillEllipse(b, 3, 3, 26, 26);
-                using (Pen p = new Pen(Color.White, 2))
+                int m = Math.Max(1, (int)Math.Round(S * 0.07));
+                int rad = Math.Max(2, (int)Math.Round(S * 0.24));
+                Rectangle rect = new Rectangle(m, m, S - 2 * m, S - 2 * m);
+                using (GraphicsPath gp = RoundedRect(rect, rad))
+                using (LinearGradientBrush br = new LinearGradientBrush(
+                    rect, ControlPaint.Light(c, 0.28f), ControlPaint.Dark(c, 0.10f), 90f))
+                    g.FillPath(br, gp);
+                using (Pen p = new Pen(Color.White, Math.Max(1.4f, S * 0.11f)))
                 {
-                    // символ "метлы/галочки" — простая галочка
-                    g.DrawLines(p, new Point[] { new Point(10, 17), new Point(15, 22), new Point(23, 10) });
+                    p.StartCap = LineCap.Round; p.EndCap = LineCap.Round; p.LineJoin = LineJoin.Round;
+                    g.DrawLines(p, new PointF[] {
+                        new PointF(S * 0.30f, S * 0.53f),
+                        new PointF(S * 0.44f, S * 0.68f),
+                        new PointF(S * 0.72f, S * 0.33f) });
                 }
-                IntPtr h = bmp.GetHicon();
-                return Icon.FromHandle(h);
+            }
+            return bmp;
+        }
+
+        // Сборка .ico из набора PNG (сохраняет альфу) и создание Icon из потока.
+        private static Icon IconFromBitmaps(Bitmap[] sizes)
+        {
+            using (MemoryStream ms = new MemoryStream())
+            {
+                BinaryWriter bw = new BinaryWriter(ms);
+                bw.Write((ushort)0); bw.Write((ushort)1); bw.Write((ushort)sizes.Length);
+                byte[][] pngs = new byte[sizes.Length][];
+                for (int i = 0; i < sizes.Length; i++)
+                {
+                    using (MemoryStream s = new MemoryStream())
+                    {
+                        sizes[i].Save(s, ImageFormat.Png);
+                        pngs[i] = s.ToArray();
+                    }
+                }
+                int offset = 6 + 16 * sizes.Length;
+                for (int i = 0; i < sizes.Length; i++)
+                {
+                    int S = sizes[i].Width;
+                    bw.Write((byte)(S >= 256 ? 0 : S));
+                    bw.Write((byte)(S >= 256 ? 0 : S));
+                    bw.Write((byte)0); bw.Write((byte)0);
+                    bw.Write((ushort)1); bw.Write((ushort)32);
+                    bw.Write((uint)pngs[i].Length);
+                    bw.Write((uint)offset);
+                    offset += pngs[i].Length;
+                }
+                for (int i = 0; i < sizes.Length; i++) bw.Write(pngs[i]);
+                bw.Flush();
+                ms.Position = 0;
+                return new Icon(ms);
             }
         }
 
@@ -1543,6 +1860,7 @@ namespace WindowsProcessCleaner
         {
             lv.OwnerDraw = true;
             lv.GridLines = false;
+            lv.ShowItemToolTips = true; // полный текст обрезанных ячеек по наведению
             lv.HeaderStyle = ColumnHeaderStyle.Nonclickable;
             lv.DrawColumnHeader += Lv_DrawColumnHeader;
             lv.DrawItem += delegate(object s, DrawListViewItemEventArgs e) { e.DrawDefault = false; };
@@ -1606,17 +1924,34 @@ namespace WindowsProcessCleaner
         private void DrawCheck(Graphics g, Rectangle r, bool check)
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
-            using (SolidBrush b = new SolidBrush(check ? _theme.Accent : _theme.Surface))
-                g.FillRectangle(b, r);
-            using (Pen p = new Pen(check ? _theme.Accent : _theme.Border, 1.5f))
-                g.DrawRectangle(p, r);
+            using (GraphicsPath gp = RoundedRect(r, 4))
+            {
+                using (SolidBrush b = new SolidBrush(check ? _theme.Accent : _theme.Surface))
+                    g.FillPath(b, gp);
+                using (Pen p = new Pen(check ? _theme.Accent : _theme.Border, 1.6f))
+                    g.DrawPath(p, gp);
+            }
             if (check)
-                using (Pen p = new Pen(_theme.AccentText, 2f))
+                using (Pen p = new Pen(_theme.AccentText, 2.2f))
+                {
+                    p.StartCap = LineCap.Round; p.EndCap = LineCap.Round; p.LineJoin = LineJoin.Round;
                     g.DrawLines(p, new Point[] {
-                        new Point(r.Left + 3, r.Top + 8),
+                        new Point(r.Left + 4, r.Top + 9),
                         new Point(r.Left + 7, r.Top + 12),
-                        new Point(r.Left + 14, r.Top + 4) });
+                        new Point(r.Left + 13, r.Top + 5) });
+                }
             g.SmoothingMode = SmoothingMode.Default;
+        }
+
+        private void RoundControl(Control c, int radius)
+        {
+            try
+            {
+                if (c.Width <= 2 || c.Height <= 2) return;
+                using (GraphicsPath gp = RoundedRect(new Rectangle(0, 0, c.Width, c.Height), radius))
+                    c.Region = new Region(gp);
+            }
+            catch { }
         }
 
         // ---------- Навигация ----------
@@ -1626,7 +1961,27 @@ namespace WindowsProcessCleaner
             for (int i = 0; i < _pages.Length; i++) _pages[i].Visible = (i == index);
             UpdateNav();
             FillColumns();
+            RefreshCurrentPage(index);
         }
+
+        // Авто-обновление списка при переходе на вкладку (лёгкие источники).
+        private void RefreshCurrentPage(int index)
+        {
+            if (!_ready) return;
+            try
+            {
+                switch (index)
+                {
+                    case 1: RefreshPorts(); break;    // Dev Cleanup — занятые порты
+                    case 4: RefreshApps(); break;     // Программы
+                    case 5: RefreshStartup(); break;  // Автозапуск
+                    case 7: RefreshHistory(); break;  // История
+                }
+            }
+            catch { }
+        }
+
+        private bool _ready;
 
         private void FillColumns()
         {
@@ -1646,21 +2001,21 @@ namespace WindowsProcessCleaner
                 if (b == null) continue;
                 b.UseVisualStyleBackColor = false;
                 b.FlatAppearance.BorderSize = 0;
+                b.BackColor = _theme.Bg;
                 if (i == _currentPage)
                 {
-                    b.BackColor = _theme.Surface;
                     b.ForeColor = _theme.Accent;
-                    b.FlatAppearance.MouseOverBackColor = _theme.Surface;
+                    b.FlatAppearance.MouseOverBackColor = _theme.Bg;
                 }
                 else
                 {
-                    b.BackColor = _theme.Bg;
                     b.ForeColor = _theme.Subtle;
                     b.FlatAppearance.MouseOverBackColor = _theme.Dark
-                        ? ControlPaint.Light(_theme.Bg, 0.25f)
-                        : ControlPaint.Dark(_theme.Bg, 0.03f);
+                        ? ControlPaint.Light(_theme.Bg, 0.30f)
+                        : ControlPaint.Dark(_theme.Bg, 0.04f);
                 }
             }
+            if (_navPanel != null) _navPanel.Invalidate();
         }
 
         // ---------- Тема ----------
@@ -1722,6 +2077,12 @@ namespace WindowsProcessCleaner
                             ? ControlPaint.Light(_theme.Surface, 0.15f)
                             : ControlPaint.Dark(_theme.Surface, 0.03f);
                     }
+                    RoundControl(b, 8);
+                }
+                else if (c is RichTextBox)
+                {
+                    c.BackColor = _theme.Surface;
+                    c.ForeColor = _theme.Text;
                 }
                 else if (c is TextBox)
                 {
@@ -1750,7 +2111,9 @@ namespace WindowsProcessCleaner
                 else if (c is Label)
                 {
                     c.BackColor = Color.Transparent;
-                    c.ForeColor = _theme.Text;
+                    if (c.Name == "section") c.ForeColor = _theme.Accent;
+                    else if (c.Name == "warn" || c.Name == "muted") c.ForeColor = _theme.Subtle;
+                    else c.ForeColor = _theme.Text;
                 }
                 else if (c is CheckBox)
                 {
@@ -1780,6 +2143,8 @@ namespace WindowsProcessCleaner
             StartPosition = FormStartPosition.CenterScreen;
             Font = new Font("Segoe UI", 10.5F);
             MinimumSize = new Size(940, 620);
+            Icon = _iconWindow;
+            ShowIcon = true;
 
             // Собственная навигация вместо TabControl (полностью тематизируется).
             Panel nav = new Panel();
@@ -1790,9 +2155,9 @@ namespace WindowsProcessCleaner
             _content = new Panel();
             _content.Dock = DockStyle.Fill;
 
-            _pages = new Control[] { BuildScanTab(), BuildDevTab(), BuildCleanTab(), BuildDockerTab(), BuildAppsTab(), BuildSettingsTab(), BuildHistoryTab() };
-            string[] titles = { Tr.S("Сканирование", "Scan"), "Dev Cleanup", Tr.S("Очистка диска", "Disk Cleanup"), "Docker", Tr.S("Программы", "Programs"), Tr.S("Настройки", "Settings"), Tr.S("История", "History") };
-            int[] widths = { 145, 130, 140, 95, 125, 120, 105 };
+            _pages = new Control[] { BuildScanTab(), BuildDevTab(), BuildCleanTab(), BuildDockerTab(), BuildAppsTab(), BuildStartupTab(), BuildSettingsTab(), BuildHistoryTab() };
+            string[] titles = { Tr.S("Сканирование", "Scan"), "Dev Cleanup", Tr.S("Очистка диска", "Disk Cleanup"), "Docker", Tr.S("Программы", "Programs"), Tr.S("Автозапуск", "Startup"), Tr.S("Настройки", "Settings"), Tr.S("История", "History") };
+            int[] widths = { 130, 118, 128, 82, 115, 118, 110, 95 };
             _navButtons = new Button[titles.Length];
             int nx = 8;
             for (int i = 0; i < titles.Length; i++)
@@ -1809,6 +2174,16 @@ namespace WindowsProcessCleaner
                 _navButtons[i] = b;
                 nx += widths[i] + 4;
             }
+            _navPanel = nav;
+            nav.Paint += delegate(object s, PaintEventArgs pe)
+            {
+                if (_navButtons == null || _currentPage < 0 || _currentPage >= _navButtons.Length) return;
+                Button b = _navButtons[_currentPage];
+                using (SolidBrush br = new SolidBrush(_theme.Accent))
+                    pe.Graphics.FillRectangle(br, b.Left, nav.Height - 3, b.Width, 3);
+                using (Pen pen = new Pen(_theme.Border))
+                    pe.Graphics.DrawLine(pen, 0, nav.Height - 1, nav.Width, nav.Height - 1);
+            };
 
             foreach (Control page in _pages)
             {
@@ -1872,7 +2247,8 @@ namespace WindowsProcessCleaner
             lblWarn.Text = Tr.S("⚠ завершает любые ваши простаивающие/осиротевшие процессы",
                                 "⚠ terminates any of your idle/orphaned processes");
             lblWarn.Left = 450; lblWarn.Top = 30; lblWarn.Width = 460; lblWarn.Height = 18;
-            lblWarn.Font = new Font(Font.FontFamily, 8.5F);
+            lblWarn.Font = new Font(Font.FontFamily, 9.5F);
+            lblWarn.AutoEllipsis = true;
 
             // ряд 2
             Button btnClean = MkButton(Tr.S("Очистить выбранные", "Clean selected"), 0, 52, 200, true);
@@ -2003,111 +2379,127 @@ namespace WindowsProcessCleaner
         private Control BuildSettingsTab()
         {
             Panel tab = new Panel();
-            tab.AutoScroll = true;
-            tab.Padding = new Padding(14, 12, 14, 12);
+            tab.Padding = new Padding(18, 14, 18, 14);
 
-            int y = 14;
-            int labelX = 14, ctrlX = 260;
+            // ---- ЛЕВАЯ КОЛОНКА ----
+            int lx = 18, cx = 280, y = 8;
+            SectionHeader(tab, Tr.S("Критерии заброшенности", "Abandonment criteria"), lx, ref y);
+            _numCpu = MakeNum(tab, Tr.S("Порог CPU, %:", "CPU threshold, %:"), lx, cx, ref y, 0, 100, 2, 0.1M);
+            _numIdle = MakeNum(tab, Tr.S("Время простоя, мин:", "Idle time, min:"), lx, cx, ref y, 0, 1440, 0, 1);
+            _numMinLife = MakeNum(tab, Tr.S("Мин. время жизни, мин:", "Min lifetime, min:"), lx, cx, ref y, 0, 1440, 0, 1);
+            _numGlobalIdle = MakeNum(tab, Tr.S("Простой для глобального режима, мин:", "Idle for global mode, min:"), lx, cx, ref y, 1, 1440, 0, 1);
 
-            _numCpu = MakeNum(tab, Tr.S("Порог CPU, %:", "CPU threshold, %:"), labelX, ctrlX, ref y, 0, 100, 2, 0.1M);
-            _numIdle = MakeNum(tab, Tr.S("Время простоя, мин:", "Idle time, min:"), labelX, ctrlX, ref y, 0, 1440, 0, 1);
-            _numMinLife = MakeNum(tab, Tr.S("Мин. время жизни процесса, мин:", "Min process lifetime, min:"), labelX, ctrlX, ref y, 0, 1440, 0, 1);
-            _numInterval = MakeNum(tab, Tr.S("Автоочистка каждые (часов, 1..24):", "Auto-clean every (hours, 1..24):"), labelX, ctrlX, ref y, 1, 24, 0, 1);
-            _numGlobalIdle = MakeNum(tab, Tr.S("Простой для глобального режима, мин:", "Idle time for global mode, min:"), labelX, ctrlX, ref y, 1, 1440, 0, 1);
+            y += 12;
+            SectionHeader(tab, Tr.S("Автоматизация", "Automation"), lx, ref y);
+            _numInterval = MakeNum(tab, Tr.S("Автоочистка каждые (часов, 1..24):", "Auto-clean every (hours, 1..24):"), lx, cx, ref y, 1, 24, 0, 1);
+            _chkAuto = MakeCheck(tab, Tr.S("Включить автоочистку по таймеру", "Enable auto-clean timer"), lx, ref y);
+            _chkExcludeInstalled = MakeCheck(tab, Tr.S("Глобально: не трогать Program Files", "Global: don't touch Program Files"), lx, ref y);
+            _chkAutostart = MakeCheck(tab, Tr.S("Запускать вместе с Windows", "Start with Windows"), lx, ref y);
+            _chkStartMin = MakeCheck(tab, Tr.S("Стартовать свёрнутым в трей", "Start minimized to tray"), lx, ref y);
 
-            _chkAuto = MakeCheck(tab, Tr.S("Включить автоочистку по таймеру", "Enable auto-clean timer"), labelX, ref y);
-            _chkExcludeInstalled = MakeCheck(tab, Tr.S("Глобально: не трогать установленный софт (Program Files)", "Global: don't touch installed software (Program Files)"), labelX, ref y);
-            _chkAutostart = MakeCheck(tab, Tr.S("Запускать вместе с Windows", "Start with Windows"), labelX, ref y);
-            _chkStartMin = MakeCheck(tab, Tr.S("Стартовать свёрнутым в трей", "Start minimized to tray"), labelX, ref y);
-
+            y += 12;
+            SectionHeader(tab, Tr.S("Оформление", "Appearance"), lx, ref y);
             Label lblTheme = new Label();
-            lblTheme.Text = Tr.S("Тема оформления:", "Theme:"); lblTheme.Left = labelX; lblTheme.Top = y + 3; lblTheme.Width = 240;
+            lblTheme.Text = Tr.S("Тема оформления:", "Theme:"); lblTheme.Left = lx; lblTheme.Top = y + 4; lblTheme.Width = 250;
             tab.Controls.Add(lblTheme);
             _cmbTheme = new ComboBox();
             _cmbTheme.DropDownStyle = ComboBoxStyle.DropDownList;
-            _cmbTheme.Left = ctrlX; _cmbTheme.Top = y; _cmbTheme.Width = 200;
+            _cmbTheme.Left = cx; _cmbTheme.Top = y; _cmbTheme.Width = 200;
             _cmbTheme.Items.AddRange(new object[] { Tr.S("По системе", "System"), Tr.S("Светлая", "Light"), Tr.S("Тёмная", "Dark") });
             _cmbTheme.SelectedIndexChanged += delegate { PreviewTheme(); };
             tab.Controls.Add(_cmbTheme);
             y += 36;
 
             Label lblLang = new Label();
-            lblLang.Text = Tr.S("Язык / Language:", "Язык / Language:"); lblLang.Left = labelX; lblLang.Top = y + 3; lblLang.Width = 240;
+            lblLang.Text = "Язык / Language:"; lblLang.Left = lx; lblLang.Top = y + 4; lblLang.Width = 250;
             tab.Controls.Add(lblLang);
             _cmbLang = new ComboBox();
             _cmbLang.DropDownStyle = ComboBoxStyle.DropDownList;
-            _cmbLang.Left = ctrlX; _cmbLang.Top = y; _cmbLang.Width = 200;
+            _cmbLang.Left = cx; _cmbLang.Top = y; _cmbLang.Width = 200;
             _cmbLang.Items.AddRange(new object[] { "Русский", "English" });
             tab.Controls.Add(_cmbLang);
             y += 40;
+            int leftBottom = y;
 
-            y += 6;
-            AddLabel(tab, Tr.S("Отслеживаемые процессы (по одному в строке):", "Watched processes (one per line):"), labelX, ref y);
-            _txtWatch = MakeMultiline(tab, labelX, ref y, 240);
-
-            AddLabel(tab, Tr.S("Белый список — никогда не завершать:", "Whitelist — never terminate:"), labelX, ref y);
-            _txtWhite = MakeMultiline(tab, labelX, ref y, 240);
-
-            AddLabel(tab, Tr.S("Dev-порты (через запятую):", "Dev ports (comma-separated):"), labelX, ref y);
+            // ---- ПРАВАЯ КОЛОНКА ----
+            int rx = 540, ry = 8, rw = 400;
+            SectionHeader(tab, Tr.S("Списки", "Lists"), rx, ref ry);
+            AddLabel(tab, Tr.S("Отслеживаемые процессы (по одному в строке):", "Watched processes (one per line):"), rx, ref ry);
+            _txtWatch = MakeMultilineAt(tab, rx, ref ry, rw, 150);
+            AddLabel(tab, Tr.S("Белый список — никогда не завершать:", "Whitelist — never terminate:"), rx, ref ry);
+            _txtWhite = MakeMultilineAt(tab, rx, ref ry, rw, 150);
+            AddLabel(tab, Tr.S("Dev-порты (через запятую):", "Dev ports (comma-separated):"), rx, ref ry);
             _txtPorts = new TextBox();
-            _txtPorts.Left = labelX; _txtPorts.Top = y; _txtPorts.Width = 760;
+            _txtPorts.Left = rx; _txtPorts.Top = ry; _txtPorts.Width = rw;
             tab.Controls.Add(_txtPorts);
-            y += 34;
+            ry += 36;
 
+            // ---- КНОПКИ ----
+            int by = Math.Max(leftBottom, ry) + 14;
             Button save = new Button();
             save.Text = Tr.S("Сохранить настройки", "Save settings");
             save.Tag = "primary";
-            save.Left = labelX; save.Top = y; save.Width = 200; save.Height = 32;
+            save.Left = lx; save.Top = by; save.Width = 210; save.Height = 36;
             save.Click += delegate { SaveSettingsFromUi(); };
             tab.Controls.Add(save);
 
             Button openDir = new Button();
             openDir.Text = Tr.S("Папка данных", "Data folder");
-            openDir.Left = 224; openDir.Top = y; openDir.Width = 150; openDir.Height = 32;
+            openDir.Left = lx + 222; openDir.Top = by; openDir.Width = 160; openDir.Height = 36;
             openDir.Click += delegate { try { Process.Start("explorer.exe", _engine.DataDir); } catch { } };
             tab.Controls.Add(openDir);
 
             return tab;
         }
 
+        private void SectionHeader(Panel tab, string text, int lx, ref int y)
+        {
+            Label l = new Label();
+            l.Text = text; l.Left = lx; l.Top = y; l.AutoSize = true;
+            l.Font = new Font(Font.FontFamily, 11F, FontStyle.Bold);
+            l.Name = "section";
+            tab.Controls.Add(l);
+            y += 30;
+        }
+
         private NumericUpDown MakeNum(Panel tab, string label, int lx, int cx, ref int y,
             decimal min, decimal max, int dec, decimal step)
         {
             Label l = new Label();
-            l.Text = label; l.Left = lx; l.Top = y + 3; l.Width = 240;
+            l.Text = label; l.Left = lx; l.Top = y + 4; l.Width = cx - lx - 8;
             tab.Controls.Add(l);
             NumericUpDown n = new NumericUpDown();
             n.Left = cx; n.Top = y; n.Width = 120;
             n.Minimum = min; n.Maximum = max; n.DecimalPlaces = dec; n.Increment = step;
             tab.Controls.Add(n);
-            y += 32;
+            y += 34;
             return n;
         }
 
         private CheckBox MakeCheck(Panel tab, string label, int lx, ref int y)
         {
             CheckBox c = new CheckBox();
-            c.Text = label; c.Left = lx; c.Top = y; c.Width = 420;
+            c.Text = label; c.Left = lx; c.Top = y; c.Width = 480; c.Height = 24;
             tab.Controls.Add(c);
-            y += 28;
+            y += 30;
             return c;
         }
 
         private void AddLabel(Panel tab, string text, int lx, ref int y)
         {
             Label l = new Label();
-            l.Text = text; l.Left = lx; l.Top = y; l.Width = 500;
+            l.Text = text; l.Left = lx; l.Top = y; l.Width = 500; l.Height = 20;
             tab.Controls.Add(l);
-            y += 22;
+            y += 24;
         }
 
-        private TextBox MakeMultiline(Panel tab, int lx, ref int y, int h)
+        private TextBox MakeMultilineAt(Panel tab, int lx, ref int y, int w, int h)
         {
             TextBox t = new TextBox();
             t.Multiline = true; t.ScrollBars = ScrollBars.Vertical;
-            t.Left = lx; t.Top = y; t.Width = 760; t.Height = h;
+            t.Left = lx; t.Top = y; t.Width = w; t.Height = h;
             tab.Controls.Add(t);
-            y += h + 10;
+            y += h + 12;
             return t;
         }
 
@@ -2156,10 +2548,12 @@ namespace WindowsProcessCleaner
             btnNone.Click += delegate { foreach (ListViewItem it in _lvClean.Items) it.Checked = false; };
 
             Label warn = new Label();
+            warn.Name = "muted";
             warn.Text = Tr.S("⚠ Файлы удаляются безвозвратно. Код, проекты, DriverStore и системные папки не трогаются. Закройте браузеры для полной очистки их кэша.",
                              "⚠ Files are deleted permanently. Code, projects, DriverStore and system folders are never touched. Close browsers to fully clear their cache.");
             warn.Left = 0; warn.Top = 48; warn.Width = 980; warn.Height = 18;
-            warn.Font = new Font(Font.FontFamily, 8.5F);
+            warn.Font = new Font(Font.FontFamily, 9.5F);
+            warn.AutoEllipsis = true;
 
             _lblCleanTotal = new Label();
             _lblCleanTotal.Left = 0; _lblCleanTotal.Top = 70; _lblCleanTotal.Width = 980; _lblCleanTotal.Height = 24;
@@ -2283,10 +2677,12 @@ namespace WindowsProcessCleaner
             btnUninstall.Click += delegate { DoUninstall(); };
 
             Label warn = new Label();
+            warn.Name = "muted";
             warn.Text = Tr.S("Запускается штатный деинсталлятор программы (может открыть своё окно/запросить подтверждение).",
                              "Launches the program's own uninstaller (may open its own window / ask for confirmation).");
             warn.Left = 0; warn.Top = 46; warn.Width = 980; warn.Height = 18;
-            warn.Font = new Font(Font.FontFamily, 8.5F);
+            warn.Font = new Font(Font.FontFamily, 9.5F);
+            warn.AutoEllipsis = true;
 
             _lblAppsInfo = new Label();
             _lblAppsInfo.Left = 0; _lblAppsInfo.Top = 64; _lblAppsInfo.Width = 980; _lblAppsInfo.Height = 20;
@@ -2325,6 +2721,7 @@ namespace WindowsProcessCleaner
                 it.SubItems.Add(a.Version ?? "");
                 it.SubItems.Add(a.Publisher ?? "");
                 it.SubItems.Add(a.EstimatedSizeBytes > 0 ? Engine.FormatBytes(a.EstimatedSizeBytes) : "");
+                it.ToolTipText = a.Name + (string.IsNullOrEmpty(a.ExePath) ? "" : "\r\n" + a.ExePath);
                 it.Tag = a;
                 it.ForeColor = _theme.Text;
                 it.BackColor = _theme.Surface;
@@ -2369,9 +2766,10 @@ namespace WindowsProcessCleaner
             AddDockerButton(flow, Tr.S("Удалить неиспользуемые образы", "Remove unused images"), "image prune -a -f", true);
             AddDockerButton(flow, Tr.S("Удалить неиспользуемые тома", "Remove unused volumes"), "volume prune -f", true);
             AddDockerButton(flow, Tr.S("Очистить кэш сборки", "Clear build cache"), "builder prune -a -f", true);
-            AddDockerButton(flow, Tr.S("Полная очистка (всё неиспользуемое)", "Full cleanup (all unused)"), "system prune -a -f --volumes", true);
+            AddDockerButton(flow, Tr.S("Полная очистка", "Full cleanup"), "system prune -a -f --volumes", true);
 
             Label note = new Label();
+            note.Name = "muted";
             note.Dock = DockStyle.Top;
             note.Height = 40;
             note.Text = Tr.S(
@@ -2381,15 +2779,14 @@ namespace WindowsProcessCleaner
                 "Only UNUSED data is removed (prune): stopped containers, dangling/unreferenced images, " +
                 "unused volumes, build cache. Running containers and used images are never touched.\r\n" +
                 "Kubernetes is not included: its cleanup affects a live cluster and depends on context — available on request.");
-            note.Font = new Font(Font.FontFamily, 8.5F);
+            note.Font = new Font(Font.FontFamily, 9.5F);
 
-            _txtDocker = new TextBox();
+            _txtDocker = new RichTextBox();
             _txtDocker.Dock = DockStyle.Fill;
-            _txtDocker.Multiline = true;
             _txtDocker.ReadOnly = true;
-            _txtDocker.ScrollBars = ScrollBars.Both;
             _txtDocker.WordWrap = false;
-            _txtDocker.Font = new Font("Consolas", 9.5F);
+            _txtDocker.BorderStyle = BorderStyle.FixedSingle;
+            _txtDocker.Font = new Font("Consolas", 10F);
             _txtDocker.Text = Tr.S(
                 "Нажмите «Обзор занятого места», чтобы увидеть, сколько занимает Docker.\r\n" +
                 "Требуется установленный Docker CLI (Docker Desktop) и запущенный демон.",
@@ -2439,6 +2836,157 @@ namespace WindowsProcessCleaner
             });
             t.IsBackground = true;
             t.Start();
+        }
+
+        // ---------- Вкладка: Автозапуск ----------
+        private Control BuildStartupTab()
+        {
+            Panel tab = new Panel();
+            tab.Padding = new Padding(14, 12, 14, 12);
+
+            Panel top = new Panel();
+            top.Dock = DockStyle.Top;
+            top.Height = 84;
+
+            Button btnRefresh = MkButton(Tr.S("Обновить список", "Refresh list"), 0, 6, 170, true);
+            btnRefresh.Click += delegate { RefreshStartup(); };
+
+            Label warn = new Label();
+            warn.Name = "muted";
+            warn.Text = Tr.S("Галочка = программа в автозапуске Windows. Поставьте — добавить, снимите — убрать. По умолчанию выкл.",
+                             "Checkbox = program is in Windows startup. Check to add, uncheck to remove. Off by default.");
+            warn.Left = 0; warn.Top = 46; warn.Width = 980; warn.Height = 18;
+            warn.Font = new Font(Font.FontFamily, 9.5F);
+            warn.AutoEllipsis = true;
+
+            _lblStartupInfo = new Label();
+            _lblStartupInfo.Left = 0; _lblStartupInfo.Top = 64; _lblStartupInfo.Width = 980; _lblStartupInfo.Height = 20;
+            _lblStartupInfo.Text = Tr.S("Нажмите «Обновить список»", "Click “Refresh list”");
+
+            top.Controls.Add(btnRefresh);
+            top.Controls.Add(warn);
+            top.Controls.Add(_lblStartupInfo);
+
+            _lvStartup = new ListView();
+            _lvStartup.Dock = DockStyle.Fill;
+            _lvStartup.View = View.Details;
+            _lvStartup.CheckBoxes = true;
+            _lvStartup.FullRowSelect = true;
+            _lvStartup.Columns.Add(Tr.S("Программа", "Program"), 300);
+            _lvStartup.Columns.Add(Tr.S("Издатель / источник", "Publisher / source"), 220);
+            _lvStartup.Columns.Add(Tr.S("Файл автозапуска", "Startup target"), 460);
+            SetupOwnerDraw(_lvStartup);
+            _lvStartup.ItemChecked += Startup_ItemChecked;
+
+            tab.Controls.Add(_lvStartup);
+            tab.Controls.Add(top);
+            return tab;
+        }
+
+        private void RefreshStartup()
+        {
+            Cursor = Cursors.WaitCursor;
+            List<InstalledApp> apps;
+            List<AutostartEntry> entries;
+            try
+            {
+                apps = _engine.GetInstalledApps();
+                entries = _engine.GetAutostartEntries();
+            }
+            finally { Cursor = Cursors.Default; }
+
+            _suppressStartup = true;
+            _lvStartup.Items.Clear();
+
+            HashSet<string> appExes = new HashSet<string>();
+            int onCount = 0;
+            foreach (InstalledApp a in apps)
+            {
+                bool on = _engine.IsExeInAutostart(a.ExePath, entries);
+                a.InAutostart = on;
+                if (!string.IsNullOrEmpty(a.ExePath)) appExes.Add(a.ExePath.ToLowerInvariant());
+
+                ListViewItem it = new ListViewItem(a.Name);
+                it.SubItems.Add(a.Publisher != null ? a.Publisher : "");
+                it.SubItems.Add(a.ExePath != null ? a.ExePath : Tr.S("(exe не найден)", "(exe not found)"));
+                it.ToolTipText = a.Name + (string.IsNullOrEmpty(a.ExePath) ? "" : "\r\n" + a.ExePath);
+                it.Tag = a;
+                it.Checked = on;
+                it.ForeColor = _theme.Text;
+                it.BackColor = _theme.Surface;
+                _lvStartup.Items.Add(it);
+                if (on) onCount++;
+            }
+
+            // записи автозапуска, не сопоставленные с установленными программами
+            foreach (AutostartEntry e in entries)
+            {
+                string ep = e.ExePath != null ? e.ExePath.ToLowerInvariant() : null;
+                if (ep != null && appExes.Contains(ep)) continue;
+                ListViewItem it = new ListViewItem(e.Name);
+                it.SubItems.Add(e.SourceLabel != null ? e.SourceLabel : "");
+                it.SubItems.Add(e.Command != null ? e.Command : "");
+                it.ToolTipText = e.Name + "\r\n" + (e.Command != null ? e.Command : "");
+                it.Tag = e;
+                it.Checked = true;
+                it.ForeColor = _theme.Text;
+                it.BackColor = _theme.CandidateBg;
+                _lvStartup.Items.Add(it);
+                onCount++;
+            }
+
+            _suppressStartup = false;
+            _lblStartupInfo.Text = Tr.S("Программ: ", "Programs: ") + apps.Count +
+                Tr.S("   ·   в автозапуске: ", "   ·   in startup: ") + onCount +
+                Tr.S("   ·   оранжевым — записи автозапуска вне списка установленных", "   ·   orange — startup entries outside the installed list");
+            AutoFillLastColumn(_lvStartup);
+        }
+
+        private void Startup_ItemChecked(object sender, ItemCheckedEventArgs e)
+        {
+            if (_suppressStartup) return;
+            ListViewItem it = e.Item;
+            object tag = it.Tag;
+            try
+            {
+                if (tag is InstalledApp)
+                {
+                    InstalledApp app = (InstalledApp)tag;
+                    if (it.Checked)
+                    {
+                        if (string.IsNullOrEmpty(app.ExePath))
+                        {
+                            MessageBox.Show(Tr.S("Не удалось определить exe этой программы — добавить в автозапуск нельзя.",
+                                                 "Could not determine this program's exe — cannot add to startup."),
+                                Tr.S("Автозапуск", "Startup"), MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                            _suppressStartup = true; it.Checked = false; _suppressStartup = false;
+                            return;
+                        }
+                        _engine.AddAutostart(app.Name, app.ExePath);
+                    }
+                    else
+                    {
+                        _engine.RemoveAutostart(app.ExePath, app.Name);
+                    }
+                }
+                else if (tag is AutostartEntry)
+                {
+                    AutostartEntry ent = (AutostartEntry)tag;
+                    if (it.Checked)
+                    {
+                        if (!string.IsNullOrEmpty(ent.ExePath)) _engine.AddAutostart(ent.Name, ent.ExePath);
+                    }
+                    else
+                    {
+                        _engine.RemoveAutostart(ent.ExePath, ent.Name);
+                        if (!string.IsNullOrEmpty(ent.LnkPath)) { try { File.Delete(ent.LnkPath); } catch { } }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(Tr.S("Ошибка: ", "Error: ") + ex.Message);
+            }
         }
 
         // ---------- Трей ----------
@@ -2528,6 +3076,8 @@ namespace WindowsProcessCleaner
                 it.SubItems.Add(YesNo(p.ListensTcp));
                 it.SubItems.Add(YesNo(p.HasChildren));
                 it.SubItems.Add(p.Reason);
+                it.ToolTipText = p.Name + " (pid " + p.Pid + ")" +
+                    (string.IsNullOrEmpty(p.Path) ? "" : "\r\n" + p.Path) + "\r\n" + p.Reason;
                 it.Tag = p;
                 it.Checked = p.IsCandidate;
                 it.ForeColor = _theme.Text;
@@ -2877,6 +3427,7 @@ namespace WindowsProcessCleaner
             {
                 Hide();
             }
+            _ready = true;
             RefreshHistory();
             RefreshPorts();
             BeginInvoke((MethodInvoker)delegate { FillColumns(); });

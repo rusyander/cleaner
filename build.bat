@@ -14,8 +14,12 @@ if not exist "%CSC%" (
 echo Compiler: %CSC%
 echo Building WindowsProcessCleaner.exe ...
 
+set ICONOPT=
+if exist "icon.ico" set ICONOPT=/win32icon:icon.ico
+
 "%CSC%" /nologo /target:winexe /optimize+ /out:WindowsProcessCleaner.exe ^
   /win32manifest:app.manifest ^
+  %ICONOPT% ^
   /reference:System.dll ^
   /reference:System.Core.dll ^
   /reference:System.Drawing.dll ^

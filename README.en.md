@@ -36,6 +36,8 @@ schedule.
 - **Docker.** Shows disk usage (`docker system df`) and removes unused data: stopped
   containers, images, volumes, build cache, everything at once.
 - **Programs.** Lists installed software and uninstalls it via its own uninstaller.
+- **Startup.** Lists all installed programs with a "in Windows startup" toggle: check to
+  add, uncheck to remove (registry `Run` keys + the Startup folder).
 - **Automation.** Process auto-clean timer (every 1–24 h), start with Windows (via Task
   Scheduler), tray operation, cleanup history, flexible settings.
 - **Look & feel.** Dark/light theme (or system) + dark title bar; RU/EN UI language.
@@ -137,6 +139,14 @@ System32, drive roots, code and projects are never touched.
 A tab listing installed programs (name, version, publisher, size). Check and uninstall
 them through the app — the program's own uninstaller is launched.
 
+### Startup
+A tab listing all installed programs with a checkbox toggle. Checked = the program is in
+Windows startup; check to add, uncheck to remove. Reads and writes autostart from the
+registry (`HKCU\...\Run`, `HKLM\...\Run`) and the Startup folders (user + common). Startup
+entries that aren't in the installed-programs list (scripts, shortcuts) are marked orange
+and can be disabled too. Adding always goes to the per-user `HKCU\...\Run`; by default, if
+a program isn't in startup, the toggle is off.
+
 ### Docker
 A tab for Docker cleanup (requires the Docker CLI + a running daemon). Buttons: disk
 usage overview (`docker system df`), remove stopped containers, unused images, unused
@@ -222,6 +232,7 @@ The app always runs as administrator. This is required to purge Standby Memory v
 |------|---------|
 | `ProcessCleaner.cs` | the entire application code |
 | `app.manifest` | manifest (requireAdministrator, DPI) |
+| `icon.ico` | application icon (embedded into the exe) |
 | `build.bat` | build via the built-in csc.exe |
 | `run.bat` | build if needed and run |
 | `README.md` / `README.en.md` | documentation (RU / EN) |
